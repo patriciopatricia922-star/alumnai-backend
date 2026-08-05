@@ -9,6 +9,12 @@ import logging
 import requests
 import subprocess
 from dotenv import load_dotenv
+from pydantic import BaseModel as PydanticBaseModel
+import csv
+import io
+import uuid
+from typing import Any
+import json as _json
 
 # ─── CONFIGURATION & INITIALIZATION ──────────────────────────────────────────
 load_dotenv()
@@ -62,6 +68,7 @@ app.add_middleware(
 )
 
 supabase = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_ANON_KEY"))
+supabase_admin = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_SERVICE_ROLE_KEY"))
 OCR_API_KEY = os.getenv("OCR_API_KEY", "YOUR_API_KEY_HERE")
 
 
@@ -367,6 +374,343 @@ async def verify_id_endpoint(file: UploadFile = File(...)):
         if not parsed_results:
             return {"verified": False, "reason": "No text detected."}
         return parse_id_content(parsed_results[0].get("ParsedText", ""))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ─── SURVEY CONFIG MODELS ────────────────────────────────────────────────────
+class SurveyConfigPayload(PydanticBaseModel):
+    config: dict
+
+
+# ─── SURVEY CONFIG ENDPOINTS ─────────────────────────────────────────────────
+@app.get("/api/admin/survey-config")
+def get_survey_config(survey_type: str = "college"):
+    try:
+        if survey_type == "shs":
+            resp = (
+                supabase_admin.table("survey_config")
+                .select("id, config")
+                .contains("config", {"survey_type": "shs"})
+                .order("updated_at", desc=True)
+                .limit(1)
+                .execute()
+            )
+        else:
+            resp = (
+                supabase_admin.table("survey_config")
+                .select("id, config")
+                .or_("config->>survey_type.is.null,config->>survey_type.eq.college")
+                .order("updated_at", desc=True)
+                .limit(1)
+                .execute()
+            )
+
+        rows = resp.data or []
+        if not rows:
+            return {"data": None}
+        return {"data": rows[0]}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/admin/survey-config")
+def create_survey_config(payload: SurveyConfigPayload):
+    try:
+        resp = (
+            supabase_admin.table("survey_config")
+            .insert({"config": payload.config})
+            .execute()
+        )
+        row = resp.data[0] if resp.data else None
+        return {"data": row}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.put("/api/admin/survey-config/{config_id}")
+def update_survey_config(config_id: str, payload: SurveyConfigPayload):
+    try:
+        from datetime import datetime, timezone
+        resp = (
+            supabase_admin.table("survey_config")
+            .update({
+                "config": payload.config,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            })
+            .eq("id", config_id)
+            .execute()
+        )
+        rows = resp.data or []
+        if not rows:
+            raise HTTPException(
+                status_code=404,
+                detail=f"UPDATE matched 0 rows for id={config_id}",
+            )
+        return {"data": rows[0]}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ─── ADMIN ACCOUNT MANAGEMENT MODELS ─────────────────────────────────────────
+class CreateAdminRequest(PydanticBaseModel):
+    email: str
+    first_name: str
+    last_name: str
+    role: str
+    module_permissions: dict
+
+
+class UpdatePermissionsRequest(PydanticBaseModel):
+    module_permissions: dict
+
+
+# ─── ADMIN ACCOUNT MANAGEMENT ENDPOINTS ──────────────────────────────────────
+@app.post("/api/admin/create-admin")
+def create_admin(payload: CreateAdminRequest):
+    try:
+        invite_resp = supabase_admin.auth.admin.invite_user_by_email(
+            payload.email,
+            {
+                "data": {
+                    "first_name": payload.first_name,
+                    "last_name": payload.last_name,
+                    "role": payload.role,
+                }
+            },
+        )
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    uid = getattr(getattr(invite_resp, "user", None), "id", None)
+    if not uid:
+        raise HTTPException(status_code=400, detail="Admin invite failed.")
+
+    try:
+        supabase_admin.table("users").insert({
+            "id": uid,
+            "email": payload.email,
+            "first_name": payload.first_name,
+            "last_name": payload.last_name,
+            "role": payload.role,
+            "account_status": "active",
+            "module_permissions": payload.module_permissions,
+        }).execute()
+    except Exception as e:
+        supabase_admin.auth.admin.delete_user(uid)
+        raise HTTPException(status_code=500, detail=str(e))
+
+    return {"uid": uid}
+
+
+@app.patch("/api/admin/alumni/{user_id}/permissions")
+def update_admin_permissions(user_id: str, payload: UpdatePermissionsRequest):
+    try:
+        supabase_admin.table("users").update(
+            {"module_permissions": payload.module_permissions}
+        ).eq("id", user_id).execute()
+        return {"success": True}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/admin/accounts/stats")
+def get_admin_stats():
+    try:
+        tot = supabase_admin.table("users").select("id", count="exact") \
+            .in_("role", ["admin", "superadmin"]).execute()
+        act = supabase_admin.table("users").select("id", count="exact") \
+            .in_("role", ["admin", "superadmin"]).eq("account_status", "active").execute()
+        inact = supabase_admin.table("users").select("id", count="exact") \
+            .in_("role", ["admin", "superadmin"]).eq("account_status", "inactive").execute()
+        dis = supabase_admin.table("users").select("id", count="exact") \
+            .in_("role", ["admin", "superadmin"]).eq("account_status", "disabled").execute()
+
+        return {
+            "data": {
+                "total": tot.count or 0,
+                "active": act.count or 0,
+                "inactive": inact.count or 0,
+                "disabled": dis.count or 0,
+            }
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/admin/accounts")
+def get_admin_accounts(
+    page: int = 1,
+    per_page: int = 10,
+    role_filter: str = "All Roles",
+    status_filter: str = "All Status",
+    search: str = "",
+):
+    try:
+        q = (
+            supabase_admin.table("users")
+            .select(
+                "id, first_name, last_name, email, role, account_status, created_at, module_permissions",
+                count="exact",
+            )
+            .in_("role", ["admin", "superadmin"])
+            .order("created_at", desc=True)
+        )
+
+        if role_filter == "Admin":
+            q = q.eq("role", "admin")
+        elif role_filter == "Super Admin":
+            q = q.eq("role", "superadmin")
+
+        if status_filter == "Active":
+            q = q.eq("account_status", "active")
+        elif status_filter == "Inactive":
+            q = q.eq("account_status", "inactive")
+        elif status_filter == "Disabled":
+            q = q.eq("account_status", "disabled")
+
+        if search.strip():
+            q = q.or_(
+                f"first_name.ilike.%{search}%,last_name.ilike.%{search}%,email.ilike.%{search}%"
+            )
+
+        start = (page - 1) * per_page
+        end = page * per_page - 1
+        resp = q.range(start, end).execute()
+
+        data = resp.data or []
+        count = resp.count or 0
+
+        ids = [u["id"] for u in data]
+        last_logins = {}
+        if ids:
+            login_resp = (
+                supabase_admin.table("audit_logs")
+                .select("user_id, created_at")
+                .eq("action", "Login")
+                .eq("status", "Success")
+                .in_("user_id", ids)
+                .order("created_at", desc=True)
+                .execute()
+            )
+            for l in (login_resp.data or []):
+                if l["user_id"] not in last_logins:
+                    last_logins[l["user_id"]] = l["created_at"]
+
+        result = [
+            {**u, "last_login": last_logins.get(u["id"])}
+            for u in data
+        ]
+
+        return {"data": result, "count": count}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+class AlumniCSVRow(PydanticBaseModel):
+    email: str
+    first_name: str = ""
+    middle_name: str = ""
+    last_name: str = ""
+    program: str = ""
+    batch_year: Optional[int] = None
+    account_status: str = "active"
+
+
+class UploadAlumniRequest(PydanticBaseModel):
+    rows: list[AlumniCSVRow]
+
+
+@app.post("/api/admin/alumni/bulk-upload")
+def bulk_upload_alumni(payload: UploadAlumniRequest):
+    inserted = 0
+    skipped = 0
+    errors = []
+
+    for row in payload.rows:
+        if not row.email:
+            skipped += 1
+            continue
+
+        existing = supabase_admin.table("users").select("id").eq("email", row.email).maybe_single().execute()
+        if existing.data:
+            skipped += 1
+            continue
+
+        try:
+            auth_resp = supabase_admin.auth.admin.create_user({
+                "email": row.email,
+                "password": str(uuid.uuid4()),
+                "email_confirm": True,
+            })
+        except Exception as e:
+            errors.append({"email": row.email, "message": str(e)})
+            continue
+
+        auth_id = auth_resp.user.id
+
+        try:
+            supabase_admin.table("users").insert({
+                "id": auth_id,
+                "email": row.email,
+                "first_name": row.first_name,
+                "middle_name": row.middle_name,
+                "last_name": row.last_name,
+                "program": row.program,
+                "batch_year": row.batch_year,
+                "account_status": row.account_status,
+                "role": "alumni",
+            }).execute()
+            inserted += 1
+        except Exception as e:
+            supabase_admin.auth.admin.delete_user(auth_id)
+            errors.append({"email": row.email, "message": str(e)})
+
+    return {"inserted": inserted, "skipped": skipped, "errors": errors}
+
+class UpdateStatusRequest(PydanticBaseModel):
+    status: str
+
+
+@app.get("/api/admin/alumni")
+def get_alumni():
+    try:
+        all_users = []
+        page_size = 1000
+        start = 0
+        while True:
+            resp = supabase_admin.table("users").select(
+                "id, email, first_name, middle_name, last_name, program, batch_year, account_status, role"
+            ).eq("role", "alumni").range(start, start + page_size - 1).execute()
+            batch = resp.data or []
+            all_users.extend(batch)
+            if len(batch) < page_size:
+                break
+            start += page_size
+
+        all_surveys = []
+        start = 0
+        while True:
+            resp = supabase_admin.table("survey_progress").select(
+                "user_id, completed, percentage, employment_information_data"
+            ).range(start, start + page_size - 1).execute()
+            batch = resp.data or []
+            all_surveys.extend(batch)
+            if len(batch) < page_size:
+                break
+            start += page_size
+
+        return {"data": {"users": all_users, "surveys": all_surveys}}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.patch("/api/admin/alumni/{user_id}/status")
+def update_alumni_status(user_id: str, payload: UpdateStatusRequest):
+    try:
+        supabase_admin.table("users").update(
+            {"account_status": payload.status}
+        ).eq("id", user_id).execute()
+        return {"success": True}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
