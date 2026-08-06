@@ -377,6 +377,54 @@ async def verify_id_endpoint(file: UploadFile = File(...)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
+
+class AwardPointsRequest(PydanticBaseModel):
+    user_ids: list[str]
+    points: int
+
+
+@app.post("/api/admin/award-points")
+def award_points(payload: AwardPointsRequest):
+    if payload.points <= 0:
+        raise HTTPException(status_code=400, detail="Points must be greater than 0.")
+    if not payload.user_ids:
+        raise HTTPException(status_code=400, detail="No alumni selected.")
+
+    updated = []
+    errors = []
+
+    for user_id in payload.user_ids:
+        try:
+            row_resp = (
+                supabase_admin.table("users")
+                .select("reward_points")
+                .eq("id", user_id)
+                .single()
+                .execute()
+            )
+            current = (row_resp.data or {}).get("reward_points") or 0
+            new_balance = current + payload.points
+
+            update_resp = (
+                supabase_admin.table("users")
+                .update({"reward_points": new_balance})
+                .eq("id", user_id)
+                .execute()
+            )
+            if not update_resp.data:
+                errors.append({"user_id": user_id, "message": "Update matched 0 rows."})
+                continue
+
+            updated.append({"user_id": user_id, "new_balance": new_balance})
+        except Exception as e:
+            errors.append({"user_id": user_id, "message": str(e)})
+
+    if not updated:
+        raise HTTPException(status_code=500, detail={"message": "No users were updated.", "errors": errors})
+
+    return {"success": True, "points": payload.points, "updated": updated, "errors": errors}
+
 # ─── SURVEY CONFIG MODELS ────────────────────────────────────────────────────
 class SurveyConfigPayload(PydanticBaseModel):
     config: dict
