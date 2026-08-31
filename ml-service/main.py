@@ -223,8 +223,144 @@ def parse_full_name(tokens, first_line_token_count=None):
     return first_name, middle_name, last_name
 
 
+# ─── OCR OVERLAY GEOMETRY HELPERS ────────────────────────────────────────────
+# These helpers use OCR.space's optional TextOverlay (bounding-box) data to
+# tell a genuine name line apart from a stray, low-confidence text-like
+# fragment (e.g. a logo/seal mark on the ID misread as a short word). They
+# are intentionally *structural only*: they compare a candidate line's
+# geometry (height, width-per-character, vertical spacing) against the
+# other trusted lines detected in that same scan. Nothing here inspects or
+# judges the text content of a line — the same logic applies no matter what
+# name is on the card, so it generalizes to any (unknown) alumni.
+#
+# All reference values (median height, median gap, median width/char) are
+# computed fresh from that request's own overlay data, never hardcoded
+# pixel constants, so they naturally scale with image resolution, camera
+# distance, and ID photo framing.
+#
+# Safety: if overlay data is missing, malformed, or doesn't line up with
+# the plain-text lines already used elsewhere in this file, these helpers
+# return "no outliers found" so the caller falls back to the existing
+# keyword/length-only behavior unchanged.
+
+def _overlay_line_geometry(overlay_line):
+    """Compute (top, height, width) for one OCR.space overlay line from its
+    Words[] bounding boxes. Returns None if the line has no usable words."""
+    words = overlay_line.get("Words") or []
+    if not words:
+        return None
+    try:
+        lefts = [w.get("Left", 0) for w in words]
+        rights = [w.get("Left", 0) + w.get("Width", 0) for w in words]
+        tops = [w.get("Top", 0) for w in words]
+        heights = [w.get("Height", 0) for w in words]
+        top = overlay_line.get("MinTop", min(tops))
+        height = overlay_line.get("MaxHeight", max(heights))
+        width = max(rights) - min(lefts)
+        if width <= 0 or height <= 0:
+            return None
+        return {"top": top, "height": height, "width": width}
+    except (TypeError, ValueError):
+        return None
+
+
+def _overlay_aligns_with_lines(lines, overlay_lines):
+    """Sanity-check that overlay_lines is really the same sequence of text
+    as `lines` (same count, same content in the same order) before trusting
+    its geometry for anything. This guards against OCR.space returning a
+    differently-segmented overlay than the ParsedText we already parsed."""
+    if not overlay_lines or len(overlay_lines) != len(lines):
+        return False
+
+    def _norm(s):
+        return re.sub(r'[^A-Z0-9]', '', s.upper())
+
+    matches = 0
+    for line_text, overlay_line in zip(lines, overlay_lines):
+        a = _norm(line_text)
+        b = _norm(overlay_line.get("LineText", ""))
+        if a and b and (a == b or a in b or b in a):
+            matches += 1
+    # Require the large majority of lines to line up textually before any
+    # geometry from this overlay is trusted.
+    return matches >= max(1, round(len(lines) * 0.8))
+
+
+def geometry_outlier_indices(name_line_indices, program_line_idx, lines, overlay_lines):
+    """
+    Identify which of the candidate name-line indices are geometric
+    outliers relative to the other trusted lines on the ID (the remaining
+    candidate name lines plus the already-verified program line).
+
+    A line is only dropped when at least two independent structural checks
+    (height band, width-per-character, vertical spacing) flag it — a single
+    borderline signal (which blur, mild rotation, or shadow can easily
+    produce) is not enough on its own. With fewer than 3 reference lines
+    total there isn't enough data to establish a reliable baseline, so no
+    lines are flagged.
+
+    Returns a set of indices (subset of name_line_indices). Empty set on
+    any missing/misaligned overlay data or insufficient reference lines.
+    """
+    if not overlay_lines or not _overlay_aligns_with_lines(lines, overlay_lines):
+        return set()
+
+    anchor_idx = sorted(set(name_line_indices) | ({program_line_idx} if program_line_idx is not None else set()))
+    geoms = {}
+    for i in anchor_idx:
+        g = _overlay_line_geometry(overlay_lines[i])
+        if g:
+            geoms[i] = g
+
+    if len(geoms) < 3:
+        return set()
+
+    heights = sorted(g["height"] for g in geoms.values())
+    med_height = heights[len(heights) // 2]
+
+    ratios = {}
+    for i, g in geoms.items():
+        char_count = len(re.sub(r'\s+', '', lines[i]))
+        if char_count > 0:
+            ratios[i] = g["width"] / char_count
+    med_ratio = sorted(ratios.values())[len(ratios) // 2] if ratios else None
+
+    ordered = sorted(geoms.keys(), key=lambda i: geoms[i]["top"])
+    gaps = [geoms[b]["top"] - geoms[a]["top"] for a, b in zip(ordered, ordered[1:])]
+    gaps = [g for g in gaps if g > 0]
+    med_gap = sorted(gaps)[len(gaps) // 2] if gaps else None
+
+    outliers = set()
+    for i in name_line_indices:
+        if i not in geoms:
+            continue
+        g = geoms[i]
+        flags = 0
+
+        if not (0.5 * med_height <= g["height"] <= 1.8 * med_height):
+            flags += 1
+
+        if med_ratio and i in ratios and not (0.4 * med_ratio <= ratios[i] <= 2.5 * med_ratio):
+            flags += 1
+
+        if med_gap:
+            pos = ordered.index(i)
+            neighbor_gaps = []
+            if pos > 0:
+                neighbor_gaps.append(abs(geoms[i]["top"] - geoms[ordered[pos - 1]]["top"]))
+            if pos < len(ordered) - 1:
+                neighbor_gaps.append(abs(geoms[ordered[pos + 1]]["top"] - geoms[i]["top"]))
+            if neighbor_gaps and min(neighbor_gaps) > 2.5 * med_gap:
+                flags += 1
+
+        if flags >= 2:
+            outliers.add(i)
+
+    return outliers
+
+
 # ─── OCR PROCESSING UTILITIES ────────────────────────────────────────────────
-def parse_id_content(raw_text):
+def parse_id_content(raw_text, overlay_lines=None):
     """Parse OCR text from NU Alumni ID cards with robust university and compound name validation"""
     upper_text = raw_text.upper().replace('\n', ' ')
 
@@ -296,8 +432,26 @@ def parse_id_content(raw_text):
     # Everything before the detected program line is candidate name content.
     # If the program wasn't found at all, fall back to scanning every line
     # (previous behaviour) rather than failing outright.
-    candidate_lines = lines[:program_line_idx] if program_line_idx is not None else lines
-    name_lines = [l.strip() for l in candidate_lines if is_name_line(l)]
+    candidate_indices = list(range(program_line_idx)) if program_line_idx is not None else list(range(len(lines)))
+    name_line_indices = [i for i in candidate_indices if is_name_line(lines[i])]
+
+    # ── GEOMETRY REFINEMENT (optional, additive) ───────────────────────────
+    # If OCR.space returned usable overlay bounding boxes, drop any
+    # candidate name line(s) that are structural outliers relative to the
+    # other trusted lines on the ID (e.g. a small logo/seal fragment
+    # misread as a short word above the real name). This only ever removes
+    # lines the keyword/length filter already accepted — it never adds
+    # lines back, and on any missing/misaligned overlay data it removes
+    # nothing, leaving today's behavior exactly as it was.
+    dropped = geometry_outlier_indices(name_line_indices, program_line_idx, lines, overlay_lines)
+    if dropped:
+        logger.info(
+            "Dropped %d candidate name line(s) as geometric outliers: %r",
+            len(dropped), [lines[i] for i in dropped],
+        )
+        name_line_indices = [i for i in name_line_indices if i not in dropped]
+
+    name_lines = [lines[i].strip() for i in name_line_indices]
 
     # Normalize whitespace and reconstruct a single name string BEFORE
     # splitting it into fields. This is what makes the parser tolerant of
@@ -353,7 +507,12 @@ async def verify_id_endpoint(file: UploadFile = File(...)):
     payload = {
         'apikey': OCR_API_KEY,
         'language': 'eng',
-        'isOverlayRequired': False,
+        # Overlay (bounding-box) data lets the name parser distinguish a
+        # genuine name line from a stray misread fragment (e.g. a logo/seal
+        # mark) using line geometry — see geometry_outlier_indices(). This
+        # does not change what OCR.space recognizes, only what metadata it
+        # returns alongside the same ParsedText used previously.
+        'isOverlayRequired': True,
         'detectOrientation': True,
         'scale': True,
         'OCREngine': '2',
@@ -373,7 +532,13 @@ async def verify_id_endpoint(file: UploadFile = File(...)):
         parsed_results = data.get("ParsedResults")
         if not parsed_results:
             return {"verified": False, "reason": "No text detected."}
-        return parse_id_content(parsed_results[0].get("ParsedText", ""))
+        result = parsed_results[0]
+        overlay = result.get("TextOverlay") or {}
+        # Only use overlay lines when OCR.space actually populated them;
+        # otherwise parse_id_content falls back to its original
+        # keyword/length-only behavior automatically.
+        overlay_lines = overlay.get("Lines") if overlay.get("HasOverlay") else None
+        return parse_id_content(result.get("ParsedText", ""), overlay_lines=overlay_lines)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
