@@ -22,6 +22,17 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("alumni_id_parser")
 
+# ─── TEMPORARY OCR DIAGNOSTIC LOGGING ────────────────────────────────────────
+# Added to investigate the intermittent name-extraction issue (stray tokens
+# like "Nui" occasionally displacing the real first name). This is
+# observation-only: it does not change OCR behavior, parsing behavior, or
+# API responses in any way — it only records, per scan, the raw OCR
+# response and every intermediate step the name parser takes, so a
+# successful and a failed scan of the same ID can be compared side by side.
+# Remove this block (and its call sites, each marked "DIAGNOSTIC:") once the
+# investigation is complete.
+diag_logger = logging.getLogger("alumni_id_parser.ocr_diagnostics")
+
 try:
     sys.path.append(os.path.dirname(os.path.abspath(__file__)))
     from ai_engine import init_ai, sentiment_analyzer, feedback_summarizer, insights_generator
@@ -286,7 +297,7 @@ def _overlay_aligns_with_lines(lines, overlay_lines):
     return matches >= max(1, round(len(lines) * 0.8))
 
 
-def geometry_outlier_indices(name_line_indices, program_line_idx, lines, overlay_lines):
+def geometry_outlier_indices(name_line_indices, program_line_idx, lines, overlay_lines, diagnostics=None):
     """
     Identify which of the candidate name-line indices are geometric
     outliers relative to the other trusted lines on the ID (the remaining
@@ -301,9 +312,23 @@ def geometry_outlier_indices(name_line_indices, program_line_idx, lines, overlay
 
     Returns a set of indices (subset of name_line_indices). Empty set on
     any missing/misaligned overlay data or insufficient reference lines.
+
+    `diagnostics`, if given a dict, is filled in-place with the internal
+    calculations (alignment check result, per-line geometry, medians, and
+    per-line flag counts) purely for logging/investigation purposes. It has
+    no effect whatsoever on the function's return value or logic — passing
+    None (the default) reproduces the exact prior behavior of this function.
     """
+    if diagnostics is None:
+        diagnostics = {}
+
     if not overlay_lines or not _overlay_aligns_with_lines(lines, overlay_lines):
+        diagnostics["skipped_reason"] = (
+            "no_overlay_lines" if not overlay_lines else "overlay_not_aligned_with_text_lines"
+        )
+        diagnostics["aligned"] = False
         return set()
+    diagnostics["aligned"] = True
 
     anchor_idx = sorted(set(name_line_indices) | ({program_line_idx} if program_line_idx is not None else set()))
     geoms = {}
@@ -312,7 +337,14 @@ def geometry_outlier_indices(name_line_indices, program_line_idx, lines, overlay
         if g:
             geoms[i] = g
 
+    diagnostics["anchor_idx"] = anchor_idx
+    diagnostics["usable_geometry_count"] = len(geoms)
+    diagnostics["usable_geometry_by_line_idx"] = {
+        i: {"line_text": lines[i], **g} for i, g in geoms.items()
+    }
+
     if len(geoms) < 3:
+        diagnostics["skipped_reason"] = "fewer_than_3_lines_with_usable_geometry"
         return set()
 
     heights = sorted(g["height"] for g in geoms.values())
@@ -330,18 +362,27 @@ def geometry_outlier_indices(name_line_indices, program_line_idx, lines, overlay
     gaps = [g for g in gaps if g > 0]
     med_gap = sorted(gaps)[len(gaps) // 2] if gaps else None
 
+    diagnostics["med_height"] = med_height
+    diagnostics["med_width_per_char"] = med_ratio
+    diagnostics["med_vertical_gap"] = med_gap
+    diagnostics["per_line_flags"] = {}
+
     outliers = set()
     for i in name_line_indices:
         if i not in geoms:
+            diagnostics["per_line_flags"][i] = {"line_text": lines[i], "reason": "no_usable_geometry"}
             continue
         g = geoms[i]
         flags = 0
+        flag_reasons = []
 
         if not (0.5 * med_height <= g["height"] <= 1.8 * med_height):
             flags += 1
+            flag_reasons.append("height_out_of_band")
 
         if med_ratio and i in ratios and not (0.4 * med_ratio <= ratios[i] <= 2.5 * med_ratio):
             flags += 1
+            flag_reasons.append("width_per_char_out_of_band")
 
         if med_gap:
             pos = ordered.index(i)
@@ -352,16 +393,39 @@ def geometry_outlier_indices(name_line_indices, program_line_idx, lines, overlay
                 neighbor_gaps.append(abs(geoms[ordered[pos + 1]]["top"] - geoms[i]["top"]))
             if neighbor_gaps and min(neighbor_gaps) > 2.5 * med_gap:
                 flags += 1
+                flag_reasons.append("vertical_gap_out_of_band")
+
+        diagnostics["per_line_flags"][i] = {
+            "line_text": lines[i],
+            "height": g["height"],
+            "width_per_char": ratios.get(i),
+            "flags": flags,
+            "flag_reasons": flag_reasons,
+            "dropped": flags >= 2,
+        }
 
         if flags >= 2:
             outliers.add(i)
 
+    diagnostics["outliers"] = sorted(outliers)
     return outliers
 
 
 # ─── OCR PROCESSING UTILITIES ────────────────────────────────────────────────
-def parse_id_content(raw_text, overlay_lines=None):
-    """Parse OCR text from NU Alumni ID cards with robust university and compound name validation"""
+def parse_id_content(raw_text, overlay_lines=None, diag_id=None):
+    """Parse OCR text from NU Alumni ID cards with robust university and compound name validation.
+
+    `diag_id`, if provided, is only used to tag the temporary diagnostic log
+    entry emitted near the end of this function so it can be correlated
+    with the raw-OCR log emitted at the call site. It has no effect on
+    parsing behavior or on the returned result.
+    """
+    # DIAGNOSTIC: collects a snapshot of every intermediate step for the
+    # temporary investigation logging at the bottom of this function. Purely
+    # additive — nothing below reads from this dict, so it cannot influence
+    # parsing behavior.
+    _diag = {"diag_id": diag_id, "raw_text": raw_text, "overlay_lines_present": bool(overlay_lines)}
+
     upper_text = raw_text.upper().replace('\n', ' ')
 
     # ── STEP 1: UNIVERSITY VALIDATION ────────────────────────────────────────
@@ -370,9 +434,13 @@ def parse_id_content(raw_text, overlay_lines=None):
     is_alumni = "ALUMNI" in upper_text
 
     if not (has_national and has_university):
+        diag_logger.info("OCR_DIAGNOSTIC %s", _json.dumps(
+            {**_diag, "stage": "rejected_not_national_university"}, default=str))
         return {"verified": False, "reason": "This ID does not appear to be a National University ID."}
 
     if not is_alumni:
+        diag_logger.info("OCR_DIAGNOSTIC %s", _json.dumps(
+            {**_diag, "stage": "rejected_not_alumni"}, default=str))
         return {"verified": False, "reason": "This ID does not appear to be an Alumni ID."}
 
     # ── STEP 2: BRANCH VALIDATION (DASMARIÑAS) ───────────────────────────────
@@ -383,7 +451,11 @@ def parse_id_content(raw_text, overlay_lines=None):
         other_branches = [("MANILA", "Manila"), ("FAIRVIEW", "Fairview"), ("MOA", "MOA"), ("LIPA", "Lipa")]
         for keyword, label in other_branches:
             if keyword in upper_text:
+                diag_logger.info("OCR_DIAGNOSTIC %s", _json.dumps(
+                    {**_diag, "stage": f"rejected_wrong_branch_{label}"}, default=str))
                 return {"verified": False, "reason": f"This is an NU {label} ID. Only NU Dasmariñas is accepted."}
+        diag_logger.info("OCR_DIAGNOSTIC %s", _json.dumps(
+            {**_diag, "stage": "rejected_branch_unverified"}, default=str))
         return {"verified": False, "reason": "Could not verify as an NU Dasmariñas ID."}
 
     # ── STEP 3: DATA EXTRACTION ──────────────────────────────────────────────
@@ -435,6 +507,16 @@ def parse_id_content(raw_text, overlay_lines=None):
     candidate_indices = list(range(program_line_idx)) if program_line_idx is not None else list(range(len(lines)))
     name_line_indices = [i for i in candidate_indices if is_name_line(lines[i])]
 
+    # DIAGNOSTIC snapshot: state before any geometry filtering is applied.
+    _diag["all_lines"] = lines
+    _diag["program"] = program
+    _diag["program_line_idx"] = program_line_idx
+    _diag["batch_year"] = batch_year
+    _diag["candidate_indices_before_is_name_line"] = candidate_indices
+    _diag["candidate_lines_before_is_name_line"] = [lines[i] for i in candidate_indices]
+    _diag["name_line_indices_after_is_name_line"] = list(name_line_indices)
+    _diag["name_lines_after_is_name_line"] = [lines[i] for i in name_line_indices]
+
     # ── GEOMETRY REFINEMENT (optional, additive) ───────────────────────────
     # If OCR.space returned usable overlay bounding boxes, drop any
     # candidate name line(s) that are structural outliers relative to the
@@ -443,13 +525,22 @@ def parse_id_content(raw_text, overlay_lines=None):
     # lines the keyword/length filter already accepted — it never adds
     # lines back, and on any missing/misaligned overlay data it removes
     # nothing, leaving today's behavior exactly as it was.
-    dropped = geometry_outlier_indices(name_line_indices, program_line_idx, lines, overlay_lines)
+    _geometry_diag = {}
+    dropped = geometry_outlier_indices(name_line_indices, program_line_idx, lines, overlay_lines, diagnostics=_geometry_diag)
     if dropped:
         logger.info(
             "Dropped %d candidate name line(s) as geometric outliers: %r",
             len(dropped), [lines[i] for i in dropped],
         )
         name_line_indices = [i for i in name_line_indices if i not in dropped]
+
+    # DIAGNOSTIC snapshot: full internal state of the geometry filter (why it
+    # did or didn't drop each line), plus the line set after filtering.
+    _diag["geometry_filter_internals"] = _geometry_diag
+    _diag["geometry_dropped_line_indices"] = sorted(dropped)
+    _diag["geometry_dropped_lines"] = [lines[i] for i in dropped]
+    _diag["name_line_indices_after_geometry_filter"] = list(name_line_indices)
+    _diag["name_lines_after_geometry_filter"] = [lines[i] for i in name_line_indices]
 
     name_lines = [lines[i].strip() for i in name_line_indices]
 
@@ -487,6 +578,34 @@ def parse_id_content(raw_text, overlay_lines=None):
             "Incomplete name parse. normalized_candidate=%r raw_text=%r",
             normalized_name, raw_text,
         )
+
+    # DIAGNOSTIC: final snapshot + emit. Logged for EVERY scan that reaches
+    # this point, whether the parse looks "complete" or not — this is the
+    # only way to also capture cases like "Nui", which parse_full_name
+    # completes successfully (non-empty first/last) but with the wrong
+    # value, so the existing logger.warning above never fires for it.
+    _diag["normalized_name"] = normalized_name
+    _diag["name_tokens_passed_to_parse_full_name"] = name_tokens
+    _diag["first_line_token_count"] = first_line_token_count
+    _diag["final_first_name"] = first_name
+    _diag["final_middle_name"] = middle_name
+    _diag["final_last_name"] = last_name
+    _diag["final_program"] = program
+    _diag["final_batch_year"] = batch_year
+    _diag["raw_overlay_lines"] = overlay_lines
+    diag_logger.info("OCR_DIAGNOSTIC %s", _json.dumps({**_diag, "stage": "parsed"}, default=str))
+    diag_logger.info(
+        "OCR_DIAGNOSTIC_SUMMARY diag_id=%s | name_lines_before_geometry=%r | "
+        "name_lines_after_geometry=%r | dropped=%r | first_line_token_count=%r | "
+        "final='%s / %s / %s' | program=%r | batchYear=%r",
+        diag_id,
+        _diag["name_lines_after_is_name_line"],
+        _diag["name_lines_after_geometry_filter"],
+        _diag["geometry_dropped_lines"],
+        first_line_token_count,
+        first_name, middle_name, last_name,
+        program, batch_year,
+    )
 
     return {
         "verified": True,
@@ -527,6 +646,33 @@ async def verify_id_endpoint(file: UploadFile = File(...)):
             timeout=20,
         )
         data = response.json()
+
+        # DIAGNOSTIC: temporary investigation logging (see block near the
+        # top of this file and inside parse_id_content). This logs the raw
+        # OCR.space response for EVERY scan, independent of what our own
+        # parser later does with it, so we can tell whether the same image
+        # is producing different raw OCR output across attempts, or whether
+        # the raw OCR is consistent and our parsing is what varies. Does not
+        # affect the request/response flow below in any way.
+        diag_id = str(uuid.uuid4())
+        try:
+            _diag_parsed_results = data.get("ParsedResults") or []
+            _diag_result0 = _diag_parsed_results[0] if _diag_parsed_results else {}
+            _diag_overlay = _diag_result0.get("TextOverlay") or {}
+            diag_logger.info("OCR_DIAGNOSTIC %s", _json.dumps({
+                "diag_id": diag_id,
+                "stage": "raw_ocr_space_response",
+                "IsErroredOnProcessing": data.get("IsErroredOnProcessing"),
+                "OCRExitCode": data.get("OCRExitCode"),
+                "ParsedText": _diag_result0.get("ParsedText"),
+                "HasOverlay": _diag_overlay.get("HasOverlay"),
+                "TextOverlay_Lines": _diag_overlay.get("Lines"),
+                "FileParseExitCode": _diag_result0.get("FileParseExitCode"),
+                "ErrorMessage": _diag_result0.get("ErrorMessage"),
+            }, default=str))
+        except Exception as diag_err:
+            logger.warning("OCR diagnostic logging failed (non-fatal): %s", diag_err)
+
         if data.get("IsErroredOnProcessing"):
             return {"verified": False, "reason": "OCR Engine error."}
         parsed_results = data.get("ParsedResults")
@@ -538,7 +684,7 @@ async def verify_id_endpoint(file: UploadFile = File(...)):
         # otherwise parse_id_content falls back to its original
         # keyword/length-only behavior automatically.
         overlay_lines = overlay.get("Lines") if overlay.get("HasOverlay") else None
-        return parse_id_content(result.get("ParsedText", ""), overlay_lines=overlay_lines)
+        return parse_id_content(result.get("ParsedText", ""), overlay_lines=overlay_lines, diag_id=diag_id)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
