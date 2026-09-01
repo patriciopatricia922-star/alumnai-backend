@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, UploadFile, File
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from supabase import create_client
 from typing import Optional
@@ -622,7 +622,7 @@ def parse_id_content(raw_text, overlay_lines=None, diag_id=None):
 
 # ─── ENDPOINTS ───────────────────────────────────────────────────────────────
 @app.post("/api/verify-alumni-id")
-async def verify_id_endpoint(file: UploadFile = File(...)):
+async def verify_id_endpoint(file: UploadFile = File(...), client_meta: str = Form(None)):
     payload = {
         'apikey': OCR_API_KEY,
         'language': 'eng',
@@ -655,6 +655,18 @@ async def verify_id_endpoint(file: UploadFile = File(...)):
         # the raw OCR is consistent and our parsing is what varies. Does not
         # affect the request/response flow below in any way.
         diag_id = str(uuid.uuid4())
+
+        # DIAGNOSTIC: parse the optional non-sensitive client-side upload
+        # metadata (original/normalized dimensions, byte sizes, MIME type,
+        # user agent, viewport) sent from ocrUtils.js. Purely observational;
+        # a missing/malformed field never affects verification.
+        _diag_client_meta = None
+        if client_meta:
+            try:
+                _diag_client_meta = _json.loads(client_meta)
+            except Exception as meta_err:
+                logger.warning("Could not parse client_meta (non-fatal): %s", meta_err)
+
         try:
             _diag_parsed_results = data.get("ParsedResults") or []
             _diag_result0 = _diag_parsed_results[0] if _diag_parsed_results else {}
@@ -662,6 +674,10 @@ async def verify_id_endpoint(file: UploadFile = File(...)):
             diag_logger.info("OCR_DIAGNOSTIC %s", _json.dumps({
                 "diag_id": diag_id,
                 "stage": "raw_ocr_space_response",
+                "client_meta": _diag_client_meta,
+                "server_received_file_name": file.filename,
+                "server_received_content_type": file.content_type,
+                "server_received_file_size_bytes": len(file_content),
                 "IsErroredOnProcessing": data.get("IsErroredOnProcessing"),
                 "OCRExitCode": data.get("OCRExitCode"),
                 "ParsedText": _diag_result0.get("ParsedText"),
