@@ -416,10 +416,15 @@ def main():
     print("=" * 60)
 
     print("\n[1/8] Fetching data from Supabase ...")
+    # Ordered by user_id (survey_progress's stable per-alumni key, already used
+    # elsewhere in this codebase — see main.py's survey_progress reads) so the
+    # same unchanged dataset is presented to KFold/RF/GB in the same row order
+    # on every run. Row order was previously undefined, which meant a fixed
+    # random_state did not guarantee reproducible training.
     resp = supabase.table("survey_progress").select(
         "educational_background_data",
         "employment_information_data"
-    ).execute()
+    ).order("user_id", desc=False).execute()
     rows = resp.data
     print(f"      {len(rows)} rows retrieved.")
 
