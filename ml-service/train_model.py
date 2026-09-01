@@ -285,6 +285,7 @@ def build_features(
     ohe: OneHotEncoder,
     fold_train_df: pd.DataFrame | None = None,
     years_ahead: int = 0,
+    leave_one_out: bool = False,
 ) -> tuple[np.ndarray, np.ndarray]:
     ref_df = fold_train_df if fold_train_df is not None else df
 
@@ -295,6 +296,28 @@ def build_features(
     )
 
     merged = df.merge(prog_stats, on="degree_program", how="left")
+
+    # Leakage guard for the final full-data fit only.
+    #
+    # When fold_train_df is explicitly provided (the CV/OOF path), `dept_avg`
+    # is already computed from the fold's training rows only, so a validation
+    # row's own target never contributes to its own feature — that path is
+    # unaffected by this block.
+    #
+    # When fold_train_df is None, ref_df == df, so `dept_avg` above is the
+    # group mean of "aligned" computed INCLUDING each row's own target. That
+    # is the version used for the final full-data refit of the base models.
+    # If leave_one_out is requested here, replace it with each row's
+    # leave-one-out program mean (this program's aligned mean, excluding this
+    # respondent). Programs with exactly one respondent have no "other"
+    # respondents to average over (loo denominator = 0); those rows are left
+    # as NaN here and fall back to the existing global-mean fillna below,
+    # same as any other unmatched/missing group already does in this function.
+    if leave_one_out and fold_train_df is None:
+        group_sum  = merged["dept_avg"] * merged["cohort_size"]  # sum of "aligned" for the program
+        loo_count  = merged["cohort_size"] - 1
+        loo_sum    = group_sum - merged["aligned"]
+        merged["dept_avg"] = loo_sum / loo_count.replace(0, np.nan)
 
     prog_array = merged["degree_program"].values.reshape(-1, 1)
     _ohe_out   = ohe.transform(prog_array)
@@ -336,7 +359,11 @@ class StackingEnsemble:
         kf      = KFold(n_splits=self.n_folds, shuffle=True, random_state=42)
         indices = np.arange(len(df))
 
-        X_full, y_full = build_features(df, ohe, fold_train_df=None, years_ahead=0)
+        # leave_one_out=True: this is the final full-data fit (not a CV fold),
+        # so dept_avg is computed leave-one-out to avoid a respondent's own
+        # target contributing to their own training feature. y_full (the
+        # target column) is unaffected either way.
+        X_full, y_full = build_features(df, ohe, fold_train_df=None, years_ahead=0, leave_one_out=True)
         meta_X         = np.zeros((len(df), len(self.base_models)))
 
         for col, (name, mdl) in enumerate(self.base_models):
