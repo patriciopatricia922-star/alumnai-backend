@@ -458,6 +458,7 @@ def main():
     print("[2/8] Parsing records from survey_progress ...")
     records = []
     skipped = 0
+    shs_skipped = 0
     for row in rows:
         edu    = row.get("educational_background_data") or {}
         emp    = row.get("employment_information_data") or {}
@@ -474,6 +475,11 @@ def main():
 
         if degree != raw_degree.strip():
             print(f"      [normalise] '{raw_degree.strip()}' -> '{degree}'")
+
+        if degree in ("SHS-STEM", "SHS-ABM", "SHS-HUMSS"):
+            shs_skipped += 1
+            print(f"      [skip] row excluded — SHS program ({degree}) out of College Predictive Analytics scope")
+            continue
 
         grad_year = None
         raw_year  = edu.get("year_graduated")
@@ -502,7 +508,8 @@ def main():
         })
 
     df = pd.DataFrame(records)
-    print(f"      {len(df)} usable records  |  {skipped} skipped (no degree_program).")
+    print(f"      {len(df)} usable records  |  {skipped} skipped (no degree_program)  |  "
+          f"{shs_skipped} skipped (SHS out of scope).")
 
     if df.empty:
         print("      No usable records found. Exiting without updating predictions.")
