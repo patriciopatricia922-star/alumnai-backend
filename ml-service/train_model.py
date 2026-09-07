@@ -411,6 +411,55 @@ class StackingEnsemble:
         return float(self.predict(x.reshape(1, -1))[0])
 
 
+def summarize_cohorts(df: pd.DataFrame) -> dict:
+    """
+    Reports the graduation-year cohort(s) actually present in the current
+    training data.
+
+    This is diagnostic / forward-compatible ONLY. It does NOT feed into
+    feature engineering, model training, or predictions in any way — its
+    sole purpose is to keep `year_graduated` visible and inspectable in the
+    pipeline (instead of being parsed once and silently discarded), and to
+    surface, in plain console output, once genuine multi-cohort data exists
+    so that a real time-aware modeling change can be considered at that
+    point — not before.
+
+    Rows with a missing/unparseable year_graduated are reported separately
+    and are NOT excluded from training or alignment calculations; this
+    function only observes and reports, it never filters `df`.
+    """
+    known         = df[df["year_graduated"].notna()]
+    unknown_count = len(df) - len(known)
+
+    cohorts = sorted(int(y) for y in known["year_graduated"].unique())
+    print(f"  [cohort] Distinct graduation cohort(s) in current data: {cohorts}")
+    if unknown_count:
+        print(f"  [cohort] {unknown_count} record(s) have missing/unparseable "
+              f"year_graduated (still included in training/alignment; "
+              f"graduation year simply unknown for those rows).")
+
+    if not known.empty:
+        per_cohort = known.groupby(["degree_program", "year_graduated"]).size()
+        for (program, year), count in per_cohort.items():
+            print(f"  [cohort] '{program}' — {int(year)}: {count} respondent(s)")
+
+    if len(cohorts) > 1:
+        print("  [cohort] NOTE: multiple distinct graduation cohorts detected. "
+              "years_ahead is still hardcoded to 0 during training (see the "
+              "build_features calls in main()) — genuine cohort/time-aware "
+              "modeling has NOT been enabled by this alone. This is only a "
+              "signal that revisiting that methodology may now be worth "
+              "considering, once enough respondents exist per cohort.")
+    else:
+        print("  [cohort] Only a single graduation cohort is currently present — "
+              "not enough temporal spread to support a learned time-based "
+              "model yet. The existing projection methodology (current "
+              "alignment + heuristic growth) remains the valid approach for "
+              "this data.")
+
+    return {"cohorts": cohorts, "unknown_count": unknown_count}
+
+
 def compute_alignment(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         print("  [align] No valid survey records found. Nothing to predict.")
@@ -514,6 +563,8 @@ def main():
     if df.empty:
         print("      No usable records found. Exiting without updating predictions.")
         return
+
+    summarize_cohorts(df)
 
     print("[3/8] Computing per-program alignment rates ...")
     alignment_df = compute_alignment(df)
