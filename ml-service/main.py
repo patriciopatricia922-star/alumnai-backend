@@ -1177,50 +1177,129 @@ async def get_predictive_insights(payload: InsightsRequest):
                     feedback_texts.append(str(text))
                     break
 
+        feedback_count = len(feedback_texts)
+        # avg_len is a legitimate metric that is correctly 0 when there is no
+        # feedback at all. It is never coerced into another value here — the
+        # sentence built from it below branches explicitly on feedback_count
+        # so "0 responses" is never worded as if responses existed.
         avg_len = (
-            round(sum(len(t) for t in feedback_texts) / len(feedback_texts), 1)
-            if feedback_texts else 0
+            round(sum(len(t) for t in feedback_texts) / feedback_count, 1)
+            if feedback_count else 0
         )
 
         departments = payload.departments or []
         overview    = payload.overview_trend or []
+        dept_count  = len(departments)
 
-        trend_dir = "upward"
-        if len(overview) >= 2:
-            trend_dir = "upward" if overview[-1].value > overview[0].value else "stable or declining"
+        # ── Presentation-only thresholds ───────────────────────────────────
+        # These only decide which WORDING applies to numbers that already
+        # come from the prediction payload (e.g. "stable" vs "increase").
+        # They do not alter, recompute, or override any rate/change value.
+        STABLE_THRESHOLD_PP = 0.5   # overall change within this many points reads as "stable"
+        DECLINE_THRESHOLD_PP = 0.0  # a department "declines" only if its change is truly negative
 
-        top_dept = max(departments, key=lambda d: d.change, default=None)
-        low_dept = min(departments, key=lambda d: d.change, default=None)
-
-        year_range = (
-            f"{overview[0].year}–{overview[-1].year}" if len(overview) >= 2
-            else "the available period"
+        has_overview      = len(overview) >= 2
+        overall_current   = overview[0].value if overview else None
+        overall_predicted = overview[-1].value if overview else None
+        overall_change    = (
+            round(overall_predicted - overall_current, 1) if has_overview else None
         )
-        verbosity = "detailed" if avg_len > 100 else "brief"
+
+        def _change_clause(change):
+            """Neutral, sign-aware phrase for a percentage-point delta. Never
+            describes a percentage-point change as a plain '%' change."""
+            if change > 0:
+                return f"a projected increase of {change:.1f} percentage points"
+            if change < 0:
+                return f"a projected decrease of {abs(change):.1f} percentage points"
+            return "no projected change"
+
+        # ── Key Insight — explicit current vs. predicted, with real trend ──
+        if not has_overview:
+            overall_line = "Not enough historical data points are available to describe an overall trend."
+        elif abs(overall_change) < STABLE_THRESHOLD_PP:
+            overall_line = (
+                f"Current overall career-to-degree alignment is {overall_current:.1f}%, "
+                f"projected to remain relatively stable at {overall_predicted:.1f}% by {overview[-1].year} "
+                f"({overall_change:+.1f} percentage points)."
+            )
+        elif overall_change > 0:
+            overall_line = (
+                f"Current overall career-to-degree alignment is {overall_current:.1f}%, "
+                f"projected to increase to {overall_predicted:.1f}% by {overview[-1].year} "
+                f"({overall_change:+.1f} percentage points)."
+            )
+        else:
+            overall_line = (
+                f"Current overall career-to-degree alignment is {overall_current:.1f}%, "
+                f"projected to decrease to {overall_predicted:.1f}% by {overview[-1].year} "
+                f"({overall_change:+.1f} percentage points)."
+            )
 
         key_insight = (
-            f"Overall career-to-degree alignment is trending {trend_dir} "
-            f"across {len(departments)} department(s). "
-            f"Analysis is based on {len(feedback_texts)} alumni feedback response(s)."
+            f"{overall_line} This covers {dept_count} department(s). "
+            f"Analysis is based on {feedback_count} alumni feedback response(s)."
         )
 
-        trend_analysis = (
-            f"Predicted alignment rates span {year_range}. "
-            f"Alumni feedback averages {avg_len} characters per response, "
-            f"indicating {verbosity} engagement with the survey."
+        # ── Trend Analysis — feedback wording never implies engagement
+        #    that didn't happen when the response count is 0 ─────────────
+        year_range = (
+            f"{overview[0].year}–{overview[-1].year}" if has_overview
+            else "the available period"
         )
+        feedback_line = (
+            "No alumni feedback responses are currently available for qualitative analysis."
+            if feedback_count == 0 else
+            f"Alumni feedback averages {avg_len} characters per response "
+            f"across {feedback_count} response(s)."
+        )
+        trend_analysis = f"Predicted alignment rates span {year_range}. {feedback_line}"
 
+        # ── Department Highlights — Observed (current) vs. Predicted,
+        #    computed only from payload.departments, with distinct handling
+        #    for zero/one/many departments so comparisons are never implied
+        #    where none is meaningful ─────────────────────────────────────
         department_insights = []
-        if top_dept:
+
+        if dept_count == 0:
             department_insights.append(
-                f"{top_dept.name} leads with the highest projected growth "
-                f"(+{top_dept.change:.1f}%), reaching {top_dept.predicted_rate:.1f}% by {overview[-1].year if overview else 'the target year'}."
+                "No department-level prediction data is currently available for comparison."
             )
-        if low_dept and low_dept.code != (top_dept.code if top_dept else None):
+        elif dept_count == 1:
+            only = departments[0]
+            target_year = overview[-1].year if overview else "the target year"
             department_insights.append(
-                f"{low_dept.name} shows the smallest projected change "
-                f"({low_dept.change:+.1f}%), currently at {low_dept.current_rate:.1f}%."
+                f"{only.name} is the only department in the current forecast. "
+                f"Observed current alignment is {only.current_rate:.1f}%, predicted to reach "
+                f"{only.predicted_rate:.1f}% by {target_year} ({only.change:+.1f} percentage points)."
             )
+        else:
+            highest_current = max(departments, key=lambda d: d.current_rate)
+            lowest_current  = min(departments, key=lambda d: d.current_rate)
+            most_favorable  = max(departments, key=lambda d: d.change)
+            least_favorable = min(departments, key=lambda d: d.change)
+            target_year     = overview[-1].year if overview else "the target year"
+
+            department_insights.append(
+                f"{highest_current.name} currently has the highest observed alignment rate "
+                f"among the evaluated departments, at {highest_current.current_rate:.1f}%."
+            )
+            if lowest_current.code != highest_current.code:
+                department_insights.append(
+                    f"{lowest_current.name} currently has the lowest observed alignment rate "
+                    f"among the evaluated departments, at {lowest_current.current_rate:.1f}%."
+                )
+            department_insights.append(
+                f"{most_favorable.name} has the most favorable projected trajectory among the "
+                f"evaluated departments, with {_change_clause(most_favorable.change)}, reaching "
+                f"{most_favorable.predicted_rate:.1f}% by {target_year}."
+            )
+            if least_favorable.code != most_favorable.code:
+                department_insights.append(
+                    f"{least_favorable.name} has the least favorable projected trajectory among "
+                    f"the evaluated departments, with {_change_clause(least_favorable.change)}, "
+                    f"currently at {least_favorable.current_rate:.1f}%."
+                )
 
         if payload.selected_department:
             programs = payload.selected_department.programs or []
@@ -1230,21 +1309,44 @@ async def get_predictive_insights(payload: InsightsRequest):
                     f"contributing to its overall alignment trajectory."
                 )
 
-        recommendations = [
-            "Strengthen industry partnerships for programs with below-average alignment rates.",
-            "Use survey verbatim responses to identify specific curriculum gaps.",
-        ]
-        if low_dept and low_dept.change < 5:
+        # ── Recommendations — each line only appears when the data
+        #    actually supports it; no unconditional generic advice ────────
+        declining_depts = [d for d in departments if d.change < DECLINE_THRESHOLD_PP]
+        most_declining  = min(declining_depts, key=lambda d: d.change, default=None)
+
+        recommendations = []
+        if dept_count > 1:
+            avg_current = round(sum(d.current_rate for d in departments) / dept_count, 1)
+            below_avg = min(departments, key=lambda d: d.current_rate)
+            if below_avg.current_rate < avg_current:
+                recommendations.append(
+                    f"{below_avg.name} currently sits below the overall average alignment rate "
+                    f"of {avg_current:.1f}% among the evaluated departments."
+                )
+        if most_declining:
             recommendations.append(
-                f"Prioritise targeted intervention for {low_dept.name}, "
-                f"which shows minimal projected improvement."
+                f"{most_declining.name} has a projected decline of "
+                f"{abs(most_declining.change):.1f} percentage points over the forecast period, "
+                f"based on the current prediction data."
+            )
+        if feedback_count > 0:
+            recommendations.append(
+                f"{feedback_count} alumni feedback response(s) are available for qualitative "
+                f"review of recurring themes and keywords."
+            )
+        else:
+            recommendations.append(
+                "No alumni feedback is currently available for qualitative review."
             )
 
+        # ── Risk Alert — only fires on an actual predicted decline,
+        #    never on a department that is merely improving less than others ─
         risk_alert = None
-        if low_dept and low_dept.change < 5:
+        if most_declining:
             risk_alert = (
-                f"{low_dept.name} has the lowest projected change "
-                f"({low_dept.change:+.1f}%) and may require immediate curriculum review."
+                f"{most_declining.name} is projected to decline by "
+                f"{abs(most_declining.change):.1f} percentage points over the forecast period — "
+                f"the largest projected decline among the evaluated departments."
             )
 
         return {
