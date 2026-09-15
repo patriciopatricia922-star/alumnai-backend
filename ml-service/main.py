@@ -1260,6 +1260,126 @@ async def get_predictive_insights(payload: InsightsRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# ─── AI FEEDBACK INSIGHTS (sentiment analysis via ai_engine) ────────────────
+# Wires up the previously-unused ai_engine components (sentiment_analyzer,
+# feedback_summarizer, insights_generator — imported at the top of this file
+# but never called anywhere) to real endpoints, so the AIInsightsCard.jsx /
+# AIService.js frontend pair (which already calls these exact paths) has a
+# live backend instead of 404ing.
+#
+# NOTE ON ZERO VALUES: `total` and every *_percentage field below are
+# legitimate numeric results that may correctly be 0 (e.g. no feedback
+# submitted yet, or 0% of analyzed feedback landing in a given sentiment
+# bucket — the sentiment model only ever labels POSITIVE/NEGATIVE, so
+# neutral_percentage is routinely and correctly 0 whenever the model is
+# loaded). None of these values are computed with `or`/truthy fallbacks,
+# so a real 0 is never silently replaced with a default or dropped.
+def _fetch_feedback_texts_for_sentiment():
+    """
+    Pull free-text alumni feedback from survey_progress, using the same
+    field-selection rule already used by /api/ai/predictive-insights (see
+    above), so both endpoints report on the same underlying feedback
+    corpus. Left as a standalone helper rather than refactored into the
+    existing endpoint, to avoid touching working code.
+    """
+    resp = supabase.table("survey_progress").select(
+        "employment_information_data"
+    ).execute()
+
+    texts = []
+    for row in (resp.data or []):
+        emp = row.get("employment_information_data") or {}
+        for key in ("feedback", "comments", "suggestions", "remarks"):
+            text = emp.get(key) or ""
+            if text and len(text) > 10:
+                texts.append(str(text))
+                break
+    return texts
+
+
+@app.get("/api/ai/health")
+def ai_health_check():
+    """
+    Reports whether the ai_engine sentiment/summarization models loaded
+    successfully. Distinct from /api/health, which only checks that the
+    API process itself is up.
+    """
+    models_ready = bool(
+        AI_AVAILABLE
+        and sentiment_analyzer is not None
+        and sentiment_analyzer.model is not None
+    )
+    return {"status": "available" if models_ready else "unavailable"}
+
+
+@app.get("/api/ai/feedback-insights")
+def get_feedback_insights():
+    """
+    Runs sentiment analysis, summarization, and theme/keyword extraction
+    over alumni feedback text. Returns the shape AIInsightsCard.jsx reads:
+    status, total, summary, sentiment{positive/neutral/negative_percentage},
+    themes, keywords.
+    """
+    if not AI_AVAILABLE or sentiment_analyzer is None:
+        return {"status": "unavailable", "message": "AI service not available"}
+
+    try:
+        texts = _fetch_feedback_texts_for_sentiment()
+
+        if len(texts) == 0:
+            # Zero feedback entries is a legitimate, distinct state — it is
+            # reported explicitly as "no_data" rather than folded into the
+            # generic error branch, and total is sent as an explicit 0
+            # rather than omitted.
+            return {"status": "no_data", "total": 0}
+
+        sentiment_results = sentiment_analyzer.analyze_batch(texts)
+        total = len(sentiment_results)
+
+        if total == 0:
+            return {"status": "no_data", "total": 0}
+
+        positive_count = sum(1 for r in sentiment_results if r["label"] == "positive")
+        neutral_count  = sum(1 for r in sentiment_results if r["label"] == "neutral")
+        negative_count = sum(1 for r in sentiment_results if r["label"] == "negative")
+
+        sentiment = {
+            "positive_percentage": round(positive_count / total * 100, 1),
+            "neutral_percentage":  round(neutral_count  / total * 100, 1),
+            "negative_percentage": round(negative_count / total * 100, 1),
+        }
+
+        summary  = feedback_summarizer.summarize(texts) if feedback_summarizer else ""
+        themes   = feedback_summarizer.extract_themes(texts) if feedback_summarizer else []
+        keywords = insights_generator.extract_keywords(texts) if insights_generator else []
+
+        return {
+            "status": "success",
+            "total": total,
+            "summary": summary,
+            "sentiment": sentiment,
+            "themes": themes,
+            "keywords": keywords,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class SentimentRequest(BaseModel):
+    text: str
+
+
+@app.post("/api/ai/sentiment")
+def analyze_sentiment(payload: SentimentRequest):
+    """Analyze a single piece of feedback text (used for ad-hoc lookups)."""
+    if not AI_AVAILABLE or sentiment_analyzer is None:
+        return {"label": "neutral", "score": 0.5}
+    try:
+        return sentiment_analyzer.analyze(payload.text)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 # if __name__ == "__main__":
 #     import uvicorn
 #     uvicorn.run(app, host="0.0.0.0", port=8000)
