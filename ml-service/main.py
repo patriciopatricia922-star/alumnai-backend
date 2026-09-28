@@ -1067,7 +1067,7 @@ def get_alumni():
         start = 0
         while True:
             resp = supabase_admin.table("survey_progress").select(
-                "user_id, completed, percentage, employment_information_data"
+                "user_id, completed, percentage, employment_information_data, shs_educational_background_data"
             ).range(start, start + page_size - 1).execute()
             batch = resp.data or []
             all_surveys.extend(batch)
