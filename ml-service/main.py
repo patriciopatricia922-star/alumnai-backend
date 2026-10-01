@@ -491,8 +491,14 @@ def parse_id_content(raw_text, overlay_lines=None, diag_id=None):
 
     def is_name_line(line):
         u = line.upper()
-        blacklist = ["NATIONAL", "UNIVERSITY", "ALUMNI", "DASMARIÑAS", "CLASS", "ID", "NO."]
+        blacklist = ["NATIONAL", "UNIVERSITY", "ALUMNI", "DASMARIÑAS", "CLASS"]
         if any(b in u for b in blacklist):
+            return False
+        # "ID" / "NO." are short label tokens (e.g. "ID No."). They must match
+        # as standalone words only. A plain substring test wrongly rejected
+        # genuine name lines whose surname merely contains the letters "ID"
+        # (e.g. TRINIDAD, DAVID, FIDEL, AIDAN), dropping the surname.
+        if re.search(r'(?<![A-Z])(ID|NO\.)(?![A-Z])', u):
             return False
         if any(p.upper() in u for p in CANONICAL_PROGRAMS):
             return False
