@@ -1,6 +1,5 @@
 import os
 import warnings
-from datetime import date
 import numpy as np
 import pandas as pd
 import joblib
@@ -39,11 +38,9 @@ else:
 
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# Each graduating batch is projected over its own timeline:
-# graduation_year -> graduation_year + PREDICTION_HORIZON_YEARS
-# (e.g. batch 2025 -> 2025..2030, batch 2026 -> 2026..2031).
-PREDICTION_HORIZON_YEARS = 5
-MIN_GRAD_YEAR            = 2000   # sanity floor for a self-reported year_graduated
+BASE_YEAR       = 2025
+END_YEAR        = 2030
+PREDICT_YEARS   = list(range(BASE_YEAR, END_YEAR + 1))
 N_FOLDS         = 5
 MIN_SAMPLES_ML  = 10
 DEFAULT_GROWTH  = 1.5
@@ -478,71 +475,6 @@ def compute_alignment(df: pd.DataFrame) -> pd.DataFrame:
     return result
 
 
-def ensure_predictions_schema() -> None:
-    """Fail fast (before anything is wiped) if the predictions table has not
-    been migrated to hold per-batch rows. main() deletes the old predictions
-    before inserting new ones, so a missing column must be caught up front."""
-    try:
-        supabase.table("predictions").select(
-            "graduation_year", "respondent_count"
-        ).limit(1).execute()
-    except Exception as exc:
-        print("  [schema] predictions table is missing 'graduation_year' and/or "
-              "'respondent_count'. Run the migration first:")
-        print("             alter table public.predictions")
-        print("               add column graduation_year integer null,")
-        print("               add column respondent_count integer null;")
-        print(f"  [schema] ({exc})")
-        raise SystemExit(1)
-
-
-def compute_cohort_alignment(df: pd.DataFrame, program_dept: dict) -> pd.DataFrame:
-    """Alignment rate per (program, graduation year) with respondent counts.
-
-    Records with a missing or implausible year_graduated cannot be placed on a
-    batch timeline, so they are excluded here (and reported) rather than
-    guessed into a batch. They still count toward the pooled model training.
-    """
-    cols = ["program", "graduation_year", "alignment", "respondent_count", "department"]
-    if df.empty:
-        return pd.DataFrame(columns=cols)
-
-    years    = pd.to_numeric(df["year_graduated"], errors="coerce")
-    max_year = date.today().year + 1
-    valid    = years.between(MIN_GRAD_YEAR, max_year)
-
-    excluded = df[~valid]
-    if not excluded.empty:
-        print(f"  [cohort] WARNING: {len(excluded)} record(s) have a missing or invalid "
-              f"year_graduated and are EXCLUDED from per-batch predictions:")
-        for prog, n in excluded["degree_program"].value_counts().items():
-            print(f"             {prog}: {n}")
-
-    usable = df[valid].copy()
-    if usable.empty:
-        return pd.DataFrame(columns=cols)
-    usable["year_graduated"] = years[valid].astype(int)
-
-    grouped = (
-        usable.groupby(["degree_program", "year_graduated"])["aligned"]
-        .agg(["mean", "count"])
-        .reset_index()
-        .rename(columns={
-            "degree_program": "program",
-            "year_graduated": "graduation_year",
-            "mean":           "alignment",
-            "count":          "respondent_count",
-        })
-    )
-    grouped["alignment"]  = grouped["alignment"] * 100
-    grouped["department"] = grouped["program"].map(program_dept)
-
-    for _, r in grouped.iterrows():
-        print(f"  [cohort] '{r['program']}' batch {int(r['graduation_year'])}: "
-              f"{r['alignment']:.1f}%  (n={int(r['respondent_count'])} respondents)")
-    return grouped[cols]
-
-
 def infer_growth_rates(alignment_df: pd.DataFrame) -> dict:
     dept_groups = alignment_df.groupby("department")["alignment"]
     rates = {}
@@ -558,8 +490,6 @@ def main():
     print("=" * 60)
     print("  Stacking Ensemble - Alumni Alignment Predictor")
     print("=" * 60)
-
-    ensure_predictions_schema()
 
     print("\n[1/8] Fetching data from Supabase ...")
     # Ordered by user_id (survey_progress's stable per-alumni key, already used
@@ -680,27 +610,17 @@ def main():
         print(f"      Insufficient data ({len(df)} records < {MIN_SAMPLES_ML}). "
               f"Using rule-based projection.")
 
-    print("[7/8] Generating per-batch predictions (graduation year -> +"
-          f"{PREDICTION_HORIZON_YEARS}) ...")
-    program_dept = dict(zip(alignment_df["program"], alignment_df["department"]))
-    cohort_df    = compute_cohort_alignment(df, program_dept)
-    if cohort_df.empty:
-        print("      No records with a valid year_graduated. "
-              "Exiting without updating predictions.")
-        return
-
+    print("[7/8] Generating predictions (2025 -> 2030) ...")
     predictions = []
 
-    for _, crow in cohort_df.iterrows():
-        program    = crow["program"]
-        department = crow["department"]
-        grad_year  = int(crow["graduation_year"])
-        n_resp     = int(crow["respondent_count"])
-        base_rate  = round(float(crow["alignment"]), 2)
+    for _, arow in alignment_df.iterrows():
+        program    = arow["program"]
+        department = arow["department"]
+        base_rate  = round(float(arow["alignment"]), 2)
         growth     = growth_rates.get(department, DEFAULT_GROWTH)
 
-        for year in range(grad_year, grad_year + PREDICTION_HORIZON_YEARS + 1):
-            years_ahead = year - grad_year
+        for year in PREDICT_YEARS:
+            years_ahead = year - BASE_YEAR
 
             if use_ensemble and ensemble is not None and ohe is not None:
                 prog_cohort = df[df["degree_program"] == program]
@@ -725,11 +645,9 @@ def main():
             predictions.append({
                 "program":        program,
                 "department":     department,
-                "year":             year,
-                "predicted_rate":   predicted_rate,
-                "current_rate":     base_rate,
-                "graduation_year":  grad_year,
-                "respondent_count": n_resp,
+                "year":           year,
+                "predicted_rate": predicted_rate,
+                "current_rate":   base_rate,
             })
 
     print(f"      {len(predictions)} prediction rows generated.")
@@ -753,7 +671,7 @@ def main():
         supabase.table("predictions").upsert(pred).execute()
     print("      New predictions pushed to Supabase.")
 
-    print("\n[OK]  Done! Stacking ensemble predictions saved (per graduation batch).\n")
+    print("\n[OK]  Done! Stacking ensemble predictions saved (2025 -> 2030).\n")
 
 
 if __name__ == "__main__":
