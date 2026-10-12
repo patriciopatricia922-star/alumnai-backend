@@ -1061,7 +1061,7 @@ def get_alumni():
         start = 0
         while True:
             resp = supabase_admin.table("users").select(
-                "id, email, first_name, middle_name, last_name, program, batch_year, account_status, role"
+                "id, email, first_name, middle_name, last_name, program, batch_year, account_status, role, avatar_url"
             ).eq("role", "alumni").range(start, start + page_size - 1).execute()
             batch = resp.data or []
             all_users.extend(batch)
